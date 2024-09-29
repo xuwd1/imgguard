@@ -1,0 +1,48 @@
+#! /usr/bin/python
+
+import argparse
+import os
+import pathlib
+import subprocess
+import re
+import time
+
+GIGABYTE_PATTERN = re.compile(r"(\d+)G")
+MEGABYTE_PATTERN = re.compile(r"(\d+)M")
+
+
+
+def check_nbd_mod_loaded():
+    output = subprocess.run(["lsmod"], capture_output=True, text=True).stdout
+    if "nbd" not in output:
+        print("nbd module is not loaded. Exiting.")
+        exit(-1)
+
+
+def create_qcow2_image(target_image_path:pathlib.Path, size_str:str, fsType_str:str):
+    os.system(f"qemu-img create -f qcow2 {target_image_path} {size_str}")
+    os.system(f"sudo qemu-nbd -c /dev/nbd0 {target_image_path}")
+    # sleep 1s to make sure the nbd device is ready
+    time.sleep(1)
+    os.system(f"sudo mkfs.{fsType_str} /dev/nbd0")
+    os.system(f"sudo qemu-nbd -d /dev/nbd0")
+
+    
+
+if __name__ == "__main__":
+    check_nbd_mod_loaded()
+
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("imgPath", type=pathlib.Path, help="Path of the target image file.")
+    argparser.add_argument("size", type=str, help="Size of the image file. Valid formats are 1G, 1M")
+    argparser.add_argument("fsType",nargs='?' , type=str, help="Filesystem type of the image file. Default is ext4", default="ext4")
+
+    args = argparser.parse_args()
+
+    imgPath = pathlib.Path(args.imgPath).absolute()
+    size_str = args.size
+    fsType_str = args.fsType
+    
+    assert re.match(GIGABYTE_PATTERN, size_str) or re.match(MEGABYTE_PATTERN, size_str), "Invalid size format. Valid formats are 1G, 1M"
+
+    create_qcow2_image(imgPath, size_str, fsType_str)

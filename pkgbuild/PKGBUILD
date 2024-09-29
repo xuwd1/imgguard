@@ -1,0 +1,21 @@
+pkgname=imgguard
+pkgrel=1
+pkgver=0.1
+pkgdesc="efficiency tool for mounting qcow2 images"
+url=""
+arch=(x86_64)
+license=('GPL')
+depends=('qemu-img')
+makedepends=()
+provides=()
+conflicts=()
+groups=()
+
+PKGBUILD_DIR="$(dirname "${BASH_SOURCE[0]}")"
+
+source=("file://${PKGBUILD_DIR}/../imgguard")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "${srcdir}/imgguard" "${pkgdir}/usr/bin/imgguard"
+}

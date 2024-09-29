@@ -1,0 +1,204 @@
+#! /usr/bin/python
+
+import fcntl
+import os
+import pathlib
+import argparse
+import json
+import dataclasses
+import signal
+import subprocess
+
+@dataclasses.dataclass
+class ImgMountEntry:
+    imgPath: pathlib.Path
+    mountPoint: pathlib.Path
+    nbdDevNode: pathlib.Path
+
+    @staticmethod
+    def fromDict(d):
+        return ImgMountEntry(
+            imgPath=pathlib.Path(d["imgPath"]),
+            mountPoint=pathlib.Path(d["mountPoint"]),
+            nbdDevNode=pathlib.Path(d["nbdDevNode"])
+        )
+    
+    def toDict(self):
+        return {
+            "imgPath": str(self.imgPath),
+            "mountPoint": str(self.mountPoint),
+            "nbdDevNode": str(self.nbdDevNode)
+        }
+    
+    def is_equal_to(self, other):
+        return self.imgPath == other.imgPath and self.mountPoint == other.mountPoint and self.nbdDevNode == other.nbdDevNode
+    
+class ImgMountManagerFile:
+    def __init__(self):
+        self.manager_file_path = pathlib.Path("/tmp/imgguard_manager.lock.json") 
+        if not self.manager_file_path.exists():
+            # create the file
+            self.manager_file_path.touch()
+            with open(self.manager_file_path, 'w') as f:
+                fcntl.flock(f, fcntl.LOCK_EX) # exclusive and blocking lock
+                f.write(json.dumps([]))
+                fcntl.flock(f, fcntl.LOCK_UN)
+        
+
+
+        self.manager_file_handle = open(self.manager_file_path, 'r+')
+        self.manager_file_handle.seek(0)
+        fcntl.flock(self.manager_file_handle, fcntl.LOCK_EX) # exclusive and blocking lock
+        # read the whole file content to content
+        content = self.manager_file_handle.read()
+        # print("rawcontent:",content)
+        # parse as json
+        self.manager_file_entries = [ ImgMountEntry.fromDict(x) for x in json.loads(content)]
+        # print("parsed json:",self.manager_file_entries)
+        
+
+    def appendEntry(self, entry: ImgMountEntry):
+        self.manager_file_entries.append(entry)
+        self.manager_file_handle.seek(0)
+        self.manager_file_handle.truncate()
+        self.manager_file_handle.write(json.dumps([e.toDict() for e in self.manager_file_entries]))
+        self.manager_file_handle.flush()
+
+    def allocateNbdDevNode(self):
+        for i in range(0, 16):
+            nbdDevNode = pathlib.Path(f"/dev/nbd{i}")
+            for entry in self.manager_file_entries:
+                if entry.nbdDevNode == nbdDevNode:
+                    break
+            else:
+                return nbdDevNode
+        return None
+    
+    def IsMountPointFree(self, mountPoint: pathlib.Path):
+        for entry in self.manager_file_entries:
+            if entry.mountPoint == mountPoint:
+                return False
+        return True
+    
+    def isImgAlreadyMounted(self, imgPath: pathlib.Path):
+        for entry in self.manager_file_entries:
+            if entry.imgPath == imgPath:
+                return True
+        return False
+
+    def deleteEntry(self, entry: ImgMountEntry):
+        self.manager_file_entries = [e for e in self.manager_file_entries if not e.is_equal_to(entry)]
+        self.manager_file_handle.seek(0)
+        self.manager_file_handle.truncate()
+        self.manager_file_handle.write(json.dumps([e.toDict() for e in self.manager_file_entries]))
+        self.manager_file_handle.flush()
+    
+    def __del__(self):
+        fcntl.flock(self.manager_file_handle, fcntl.LOCK_UN)
+        self.manager_file_handle.close()
+
+LOOP_LOCK = True
+
+def signal_handler(sig, frame):
+    global LOOP_LOCK
+    LOOP_LOCK = False
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+def mount_image(imgPath:pathlib.Path, mountPoint:pathlib.Path, nbdDevNode:pathlib.Path):
+    retval = os.system(f"qemu-nbd --connect={nbdDevNode} {imgPath}") # TODO: this may fail if the img is already mounted, or the image does not exist
+    if retval != 0:
+        print("qemu-nbd --connect failed. Exiting.")
+        return False
+    retval = os.system(f"partprobe {nbdDevNode}")
+    retval = os.system(f"mount {nbdDevNode} {mountPoint}")
+    if retval != 0:
+        print("mount failed. Exiting.")
+        return False
+    return True
+
+def unmount_image(mountPoint:pathlib.Path, nbdDevNode:pathlib.Path):
+    os.system(f"umount {mountPoint}")
+    os.system(f"qemu-nbd --disconnect {nbdDevNode}")
+
+def get_compressed_image_path(imgPath:pathlib.Path):
+    return imgPath.with_suffix(".compressed.qcow2")
+
+def compress_image(imgPath:pathlib.Path, compressedImgPath:pathlib.Path):
+    os.system(f"qemu-img convert -O qcow2 -c {imgPath} {compressedImgPath}")
+
+def check_image(imgPath:pathlib.Path):
+    os.system(f"qemu-img check {imgPath}")
+
+def mainloop(imgPath:pathlib.Path, mountPoint:pathlib.Path, doCompress:bool):
+    
+    manager_file = ImgMountManagerFile()
+    allocated_nbdDevNode = manager_file.allocateNbdDevNode()
+    if allocated_nbdDevNode is None:
+        print("No available nbd device node. Exiting.")
+        return
+    print("allocated nbd DevNode:",allocated_nbdDevNode)
+    is_mount_point_free = manager_file.IsMountPointFree(mountPoint)
+    if not is_mount_point_free:
+        print("Mount point is already used. Exiting.")
+        return
+    is_img_already_mounted = manager_file.isImgAlreadyMounted(imgPath)
+    if is_img_already_mounted:
+        print("Image is already mounted. Exiting.")
+        return
+    
+    current_serving_entry = ImgMountEntry(imgPath=imgPath, mountPoint=mountPoint, nbdDevNode=allocated_nbdDevNode) 
+    status = mount_image(imgPath, mountPoint, allocated_nbdDevNode)
+    if not status:
+        print("Exception occured while mounting the image.")
+        return -1
+    manager_file.appendEntry(current_serving_entry)
+    del manager_file
+
+    print(f"Image is mounted on {mountPoint} and guarded.\nNow the script will wait for the SIGINT or SIGTERM signal to unmount the image.")
+    while LOOP_LOCK:
+        signal.pause()
+
+    print("\nReceived SIGINT or SIGTERM signal. Unmounting the image.")
+    manager_file = ImgMountManagerFile()
+    manager_file.deleteEntry(current_serving_entry)
+    unmount_image(mountPoint, allocated_nbdDevNode)
+    del manager_file
+    check_image(imgPath)
+
+    if doCompress:
+        compressedImgPath = get_compressed_image_path(imgPath)
+        compress_image(imgPath, compressedImgPath)
+        check_image(compressedImgPath)
+        print(f"Image is compressed and saved to {compressedImgPath}")
+
+def check_run_with_sudo():
+    if os.geteuid() != 0:
+        print("This script must be run as root. Rerun with sudo.")
+        exit(-1)
+
+def check_nbd_mod_loaded():
+    output = subprocess.run(["lsmod"], capture_output=True, text=True).stdout
+    if "nbd" not in output:
+        print("nbd module is not loaded. Exiting.")
+        exit(-1)
+
+if __name__ == "__main__":
+
+    check_run_with_sudo()
+    check_nbd_mod_loaded()
+
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("imgPath", help="Path to the image file to mount and guard")
+    argparser.add_argument("mountPoint", help="Path to the mount point", default="/mnt")
+    argparser.add_argument("--compress","-c", help="Compress the image file after unmounting", action="store_const", const=True, default=False)
+
+    args = argparser.parse_args()
+
+    imgPath = pathlib.Path(args.imgPath).absolute()
+    mountPoint = pathlib.Path(args.mountPoint).absolute()
+    doCompress = args.compress
+
+    mainloop(imgPath, mountPoint, doCompress)
