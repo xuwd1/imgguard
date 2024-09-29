@@ -27,7 +27,7 @@ Now you would see that the scripts hangs itself and waits for SIGINT or SIGTERM.
 
 ## Installation
 
-Arch Linux users can just build and install the `codeback` package using the provided `PKGBUILD`.
+Arch Linux users can just build and install the `imgguard` package using the provided `PKGBUILD`.
 
 ## Some other notes
 
